@@ -1,0 +1,405 @@
+---
+title: "Chicago Hotel Review Analysis & Classification"
+author: "Stone Shi"
+date: "2/25/2020"
+output:
+  rmdformats::readthedown:
+    self_contained: TRUE
+    toc_depth: 3
+    css: test.css
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1. Introduction
+
+```{r,out.width = "180%", fig.pos="h", echo = FALSE}
+knitr::include_graphics("chicago-skyline.jpg")
+```
+
+## 1.1 General Information
+
+If you plan to travel to Chicago, you probably will wonder which hotel to stay. This dataset consists of 800 truthful and 800 deceptive hotel reviews of 20 hotels in Chicago.
+
+Hotels include in the data:
+
+* affinia: Affinia Chicago (now MileNorth, A Chicago Hotel)
+
+* allegro: Hotel Allegro Chicago - a Kimpton Hotel
+
+* amalfi: Amalfi Hotel Chicago
+
+* ambassador: Ambassador East Hotel (now PUBLIC Chicago)
+
+* conrad: Conrad Chicago
+
+* fairmont: Fairmont Chicago Millennium Park
+
+* hardrock: Hard Rock Hotel Chicago
+
+* hilton: Hilton Chicago
+
+* homewood: Homewood Suites by Hilton Chicago Downtown
+
+* hyatt: Hyatt Regency Chicago
+
+* intercontinental: InterContinental Chicago
+
+* james: James Chicago
+
+* knickerbocker: Millennium Knickerbocker Hotel Chicago
+
+* monaco: Hotel Monaco Chicago - a Kimpton Hotel
+
+* omni: Omni Chicago Hotel
+
+* palmer: The Palmer House Hilton
+
+* sheraton: Sheraton Chicago Hotel and Towers
+
+* sofitel: Sofitel Chicago Water Tower
+
+* swissotel: Swissotel Chicago
+
+* talbott: The Talbott Hotel
+
+## 1.2 Load Data & Packages
+
+```{r, message=FALSE}
+## read in data and load packages
+library(tidytext)
+library(tidyverse)
+library(plotly)
+library(textstem)
+library(tm)
+library(sentimentr)
+library(patchwork)
+library(caTools)
+library(caret)
+library(dplyr)
+library(rpart)
+
+hotel <- read.csv("/Volumes/GoogleDrive/My Drive/University of Notre Dame/MSBA Spring Semester/Module 3/Unstructured Data Analytics/Homework/hw3/deceptive-opinion.csv")
+```
+
+# 2. Sentiment Analysis
+
+## 2.1 Text Pre-processing
+
+We will start by doing some text cleaning and processing on the review column. 
+
+```{r}
+hotelDF <- hotel %>%
+  filter(deceptive == "truthful") %>% 
+  dplyr::select(text, hotel, deceptive) %>% 
+  mutate(#text = str_replace_all(text, "[\\.\\!\\?]", ""),
+         text = tolower(text),
+         text = lemmatize_strings(text),
+         text = stripWhitespace(text),
+         text = removeNumbers(text))
+
+knitr::kable(head(hotelDF))
+```
+
+## 2.2 Simple Sentiment Analysis
+
+We will use `unnest_tokens()` to split the dataset into tokens.
+
+```{r}
+hotelTokens <- hotelDF %>% 
+  unnest_tokens(word, text) %>% 
+  count(deceptive, hotel, word, sort = T) %>% 
+  anti_join(stop_words, by = "word")
+```
+
+### 2.2.1 nrc lexicon
+
+```{r}
+nrcValues <- lexicon::hash_sentiment_nrc
+
+hotel_sentiment_percent <- hotelTokens %>% 
+  inner_join(nrcValues, by = c("word" = "x")) %>% 
+  group_by(hotel, y) %>%
+  summarize(total_by_sentiment = n()) %>%
+  ungroup() %>%
+  group_by(hotel) %>%
+  mutate(sentiment_percent = total_by_sentiment / sum(total_by_sentiment)) 
+
+hotel_sentiment_percent_rank <- hotel_sentiment_percent %>% 
+  filter(y == 1) %>% 
+  arrange(desc(sentiment_percent))
+
+hotel_sentiment_percent_rank$rownumber = 1:nrow(hotel_sentiment_percent_rank)
+
+hotel_sentiment_percent_rank <- hotel_sentiment_percent_rank %>% 
+  select(hotel, rownumber)
+
+## join it back to the original df
+hotel_sentiment_percent_rank_final <- hotel_sentiment_percent %>% 
+  left_join(hotel_sentiment_percent_rank, by = "hotel")
+
+p1 <- hotel_sentiment_percent_rank_final %>% 
+  ggplot(., aes(x = reorder(hotel,-rownumber), y = sentiment_percent, fill = y)) +
+  geom_col(show.legend = FALSE) +
+  labs(title = "Positive/Negative Sentiment Percent By Hotel") +
+  coord_flip()
+
+ggplotly(p1)
+```
+
+
+### 2.2.2 afinn lexicon
+
+Let's also use *afinn* lexicon to get an idea of the overall sentiment scores for 20 hotels.
+
+```{r, message = FALSE}
+hotelTokens_contributions <- hotelTokens %>% 
+  inner_join(get_sentiments("afinn")) %>% 
+  mutate(contributions = n * value)
+
+p2 <- hotelTokens_contributions %>% 
+  group_by(hotel) %>% 
+  summarize(total = sum(contributions)) %>% 
+  #top_n(20, abs(total)) %>% 
+  ggplot(aes(reorder(hotel, total), total)) +
+  geom_col(show.legend = FALSE, fill = "palegreen2", colour = "black")+
+  labs(title = 'simple sentiment analysis', x = "") +
+  coord_flip() +
+  theme_bw()
+
+ggplotly(p2)
+```
+
+I’m also curious about the words with the greatest contributions to positive/negative sentiment in those hotel reviews. 
+
+```{r}
+p3 <- hotelTokens_contributions %>% 
+  group_by(word) %>%
+  summarize(total = sum(contributions)) %>% 
+  top_n(25, abs(total)) %>%
+  ggplot(aes(reorder(word,total), total, fill = total > 0)) +
+  ggtitle('Words with the greatest contributions to positive/negative sentiment ') +
+  geom_col(show.legend = FALSE) +
+  coord_flip()
+
+ggplotly(p3)
+```
+
+Based on the contribution plot, we can see "nice", "clean" and "wonderful" are being the top 3 words that contribute most to the positive sentiments, while lobby, bad and disappoint are being the top 3 words that contribute most to the negative sentiment (I don't quite understand why *lobby* is classified as negative word). 
+
+## 2.3 Smarter Sentiment Analysis
+
+### 2.3.1 Bigrams
+
+So far we have been working only with unigrams, this will lead to issues in some cases.
+For example, "nice", depending on the context, it will have a negative sentiment if preceded by the word "not". Let's try to use bigrams to put the texts in real context.
+
+```{r}
+bigram_df_sentiment <- hotel %>% 
+  #select(text, title, date) %>%
+  mutate(text = tolower(text)) %>% 
+  mutate(text = lemmatize_strings(text)) %>%
+  filter(deceptive == "truthful") %>% 
+  unnest_tokens(bigram, text, token = "ngrams", n = 2)
+
+bigrams_separated <- bigram_df_sentiment %>% 
+  separate(bigram, c("word1", "word2"), sep = " ")
+
+bigrams_filtered <- bigrams_separated %>% 
+  filter(!word1 %in% stop_words$word) %>% 
+  filter(!word2 %in% stop_words$word)
+
+bigram_counts <- bigrams_filtered %>% 
+  count(word1, word2, sort = TRUE)
+
+bigrams_united <- bigrams_filtered %>% 
+  unite(bigram, word1, word2, sep = " ")
+
+bigrams_united %>% 
+  count(bigram, sort = TRUE)
+```
+
+Here we can see the most common bigram is "*front desk*", followed by "*michigan ave*" and "*wallking distance*"
+
+Then we can check how many terms were preceded by "not".
+
+```{r}
+bigrams_separated %>% 
+  filter(word1 == "not") %>% 
+  count(word1, word2, sort = TRUE)
+```
+
+I also noticed that “not a” is meaningless compared to “not worth” and “not recommend”. Let’s use the afinn lexicon one more time.
+
+```{r}
+not_words <- bigrams_separated %>% 
+  filter(word1 == "not") %>% 
+  inner_join(get_sentiments("afinn"), by = c(word2 = "word")) %>% 
+  count(word2, value, sort = TRUE) %>% 
+  ungroup()
+
+not_words %>% 
+  mutate(contribution = n * value) %>% 
+  arrange(desc(abs(contribution))) %>% 
+  head(15) %>% 
+  mutate(word2 = reorder(word2, contribution)) %>% 
+  ggplot(aes(word2, contribution, fill = contribution > 0)) +
+  geom_col(show.legend = FALSE) +
+  labs(title = "Top 15 words that contributed most to sentiment in the wrong direction",
+       x = "word that is proceded by word 'not'") +
+  coord_flip()
+```
+
+The bigrams “not hesitate”, “not worth”, “not good” and “not recommend” were the top words that led to the wrong direction of sentiments.
+
+### 2.3.2 valence shifters
+
+When we use sentiment analysis that is aware of context, valence (“love” is stronger than “like”), modifiers (e.g., “really love”), and adversative statements (“but,…”, “however,…”), we get a better idea about the real sentiment of the text.
+
+```{r}
+review_sentiment = sentiment(get_sentences(hotelDF), 
+          polarity_dt = lexicon::hash_sentiment_jockers,
+          valence_shifters_dt = lexicon::hash_valence_shifters)
+
+## aggregate by hotel
+hotel_sentiment <- review_sentiment %>% 
+  group_by(hotel) %>% 
+  summarize(totalSentiment = sum(sentiment))
+
+p3 <- hotel_sentiment %>% 
+  #top_n(20, abs(meanSentiment)) %>% 
+  ggplot(aes(reorder(hotel, totalSentiment), totalSentiment)) +
+  geom_col(show.legend = FALSE, fill = "salmon", colour = "black")+
+  labs(title = 'smarter sentiment analysis', x = "") +
+  coord_flip() +
+  theme_bw()
+
+p3 | p2
+```
+
+Here we can see some interesting changes on the ranking. After doing smarter sentiment analysis, *Millennium Knickerbocker Hotel Chicago* dropped from 1 to 16. *Homewood Suites by Hilton Chicago Downtown* jumped from 18 to 6, etc. 
+
+# 3. Text Classification
+
+The problem of interest is the prediction of deceptive/truthful review. There are some providers trying to influence review postings through the submission of fake reviews. It is difficult for users to detect deception.
+
+## 3.1 Feature Engineering
+
+```{r, message = FALSE}
+# create corpus
+hotel$text <- as.character(hotel$text)
+corpus <- Corpus(VectorSource(hotel$text))
+
+# text preprocessing
+stopWordRemoval = function(x) {
+  removeWords(x, c("hotel", stopwords("en")))
+}
+
+textPrepFunctions <- list(tolower,
+                         removePunctuation,
+                         stemDocument,
+                         stopWordRemoval,
+                         removeNumbers,
+                         stripWhitespace)
+
+corpus <- tm_map(corpus, FUN = tm_reduce, tmFuns = textPrepFunctions)
+```
+
+
+```{r}
+# Create matrix
+frequencies = DocumentTermMatrix(corpus)
+
+# Remove sparse terms
+sparse = removeSparseTerms(frequencies, 0.995)
+#sparse
+
+# Convert to a data frame
+hotel_text_df <- as.data.frame(as.matrix(sparse))
+colnames(hotel_text_df) <- make.names(colnames(hotel_text_df))
+
+# Add class variable
+#hotel_text_df$class <- hotel$deceptive
+rmarkdown::paged_table(head(hotel_text_df))
+```
+
+Now we are ready to use our data for the modeling stage. 
+
+## 3.2 Data Parition
+
+We will split the data into training and test set.
+
+```{r}
+library(caTools)
+set.seed(1234)
+
+minMaxScale = function(x){
+  (x - min(x)) / (max(x) - min(x))
+}
+
+scaledVars = hotel_text_df %>% 
+  mutate_all(., list(~ minMaxScale(.)))
+
+scaledVars$class <- hotel$deceptive
+
+sample.set <- caret::createDataPartition(scaledVars$class, p = 0.75, list = FALSE)
+hotel.train <- scaledVars[sample.set,]
+hotel.test <- scaledVars[-sample.set,]
+```
+
+## 3.3 Data Modeling
+
+We will use several classification techniques to classify the reviews into deceptive/truthful. 
+
+### 3.3.1 Logistic Regression
+
+```{r, warning = FALSE}
+log.mod <- glm(class ~., hotel.train, family = binomial(link = 'logit'))
+log.prob <- predict(log.mod, hotel.test, type = 'response')
+logit.pred <- as.factor(ifelse(log.prob > 0.5, 1, 0))
+
+log.table <- table(hotel.test$class, logit.pred)
+cat("The prediction accuracy of logistic regression is", sum(diag(log.table)) / nrow(hotel.test))
+```
+
+We can see the prediction accuracy is very low, let's try a few other classifers.
+
+### 3.3.2 Decision Tree
+
+```{r}
+tree.mod <- rpart(
+  class ~.,
+  method = "class",
+  data = hotel.train,
+  control = rpart.control(cp = 0.003)
+)
+
+tree.pred <- predict(tree.mod, hotel.test, type = 'class')
+tree.table <- table(hotel.test$class, tree.pred)
+cat("The prediction accuracy of decision tree is",sum(diag(tree.table)) / nrow(hotel.test))
+```
+
+### 3.3.3 Support Vector Machine
+
+We train SVM with 10-fold cross validation.
+
+```{r}
+trctrl <- trainControl(method = "cv", number = 10)
+
+
+svm.mod <- train(class ~., data = hotel.train, method = "svmLinear",
+                trControl=trctrl, metric = "Accuracy")
+
+svm.pred <- predict(svm.mod, hotel.test, type = 'raw')
+svm.table <- table(hotel.test$class, svm.pred)
+cat("The prediction accuracy of support vector machine is", sum(diag(svm.table)) / nrow(hotel.test))
+```
+
+We can also make an feature importance plot to see which words have big impact on deciding the categories of the reviews. 
+
+```{r}
+svm.imp <- varImp(svm.mod, scale = FALSE)
+plot(svm.imp, top = 20)
+```
